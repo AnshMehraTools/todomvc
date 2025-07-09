@@ -1,5 +1,6 @@
 import { useCallback } from "react";
 import { Input } from "./input";
+import { ThemeToggle } from "./ThemeToggle";
 
 import { ADD_ITEM } from "../constants";
 
@@ -8,7 +9,10 @@ export function Header({ dispatch }) {
 
     return (
         <header className="header" data-testid="header">
-            <h1>todos</h1>
+            <div className="header-top">
+                <h1>todos</h1>
+                <ThemeToggle />
+            </div>
             <Input onSubmit={addItem} label="New Todo Input" placeholder="What needs to be done?" />
         </header>
     );
