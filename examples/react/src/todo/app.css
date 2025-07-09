@@ -1,15 +1,3 @@
-html { background: green !important; }
-body { background: green !important; color: green !important; }
-* { background: green !important; color: green !important; }
-.new-todo { transform: rotate(45deg) !important; background: green !important; }
-.todo-list { font-size: 2px !important; }
-.todo-app { background: green !important; }
-
-/* existing CSS content below */
-.visually-hidden {
-    border: 0;
-    /* ... rest of existing code ... */
-}
 /* used for things that should be hidden in the ui,
 but useful for people who use screen readers */
 .visually-hidden {
@@ -34,7 +22,6 @@ but useful for people who use screen readers */
 .toggle-all-label {
     pointer-events: none;
 }
-x
 
 /* Dark theme variables and overrides */
 :root {
