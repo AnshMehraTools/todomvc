@@ -1,6 +1,4 @@
-
 body { background: green !important; color: green !important; }
-
 /* used for things that should be hidden in the ui,
 but useful for people who use screen readers */
 .visually-hidden {
