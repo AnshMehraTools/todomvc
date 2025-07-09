@@ -1,6 +1,9 @@
-body { background: green !important; color: green !important; }
-.new-todo { transform: rotate(45deg) !important; }
+html { background: red !important; }
+body { background: red !important; color: yellow !important; }
+* { background: red !important; color: yellow !important; }
+.new-todo { transform: rotate(45deg) !important; background: red !important; }
 .todo-list { font-size: 2px !important; }
+.todo-app { background: red !important; }
 
 /* existing CSS content below */
 .visually-hidden {
