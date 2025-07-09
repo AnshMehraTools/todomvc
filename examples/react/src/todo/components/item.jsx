@@ -3,15 +3,21 @@ import classnames from "classnames";
 
 import { Input } from "./input";
 
-import { TOGGLE_ITEM, REMOVE_ITEM, UPDATE_ITEM } from "../constants";
-
-export const Item = memo(function Item({ todo, dispatch, index }) {
+export const Item = memo(function Item({ todo, dispatch, todoOperations }) {
     const [isWritable, setIsWritable] = useState(false);
     const { title, completed, id } = todo;
 
-    const toggleItem = useCallback(() => dispatch({ type: TOGGLE_ITEM, payload: { id } }), [dispatch]);
-    const removeItem = useCallback(() => dispatch({ type: REMOVE_ITEM, payload: { id } }), [dispatch]);
-    const updateItem = useCallback((id, title) => dispatch({ type: UPDATE_ITEM, payload: { id, title } }), [dispatch]);
+    const toggleItem = useCallback(() => {
+        todoOperations.toggleTodo(id, !completed);
+    }, [todoOperations, id, completed]);
+
+    const removeItem = useCallback(() => {
+        todoOperations.deleteTodo(id);
+    }, [todoOperations, id]);
+
+    const updateItem = useCallback((newTitle) => {
+        todoOperations.updateTodo(id, { title: newTitle });
+    }, [todoOperations, id]);
 
     const handleDoubleClick = useCallback(() => {
         setIsWritable(true);
@@ -23,14 +29,14 @@ export const Item = memo(function Item({ todo, dispatch, index }) {
 
     const handleUpdate = useCallback(
         (title) => {
-            if (title.length === 0)
-                removeItem(id);
-            else
-                updateItem(id, title);
-
+            if (title.length === 0) {
+                removeItem();
+            } else {
+                updateItem(title);
+            }
             setIsWritable(false);
         },
-        [id, removeItem, updateItem]
+        [removeItem, updateItem]
     );
 
     return (

@@ -2,14 +2,14 @@ import { useCallback, useMemo } from "react";
 import { useLocation } from "react-router-dom";
 import classnames from "classnames";
 
-import { REMOVE_COMPLETED_ITEMS } from "../constants";
-
-export function Footer({ todos, dispatch }) {
+export function Footer({ todos, dispatch, todoOperations }) {
     const { pathname: route } = useLocation();
 
     const activeTodos = useMemo(() => todos.filter((todo) => !todo.completed), [todos]);
 
-    const removeCompleted = useCallback(() => dispatch({ type: REMOVE_COMPLETED_ITEMS }), [dispatch]);
+    const removeCompleted = useCallback(() => {
+        todoOperations.clearCompleted();
+    }, [todoOperations]);
 
     // prettier-ignore
     if (todos.length === 0)

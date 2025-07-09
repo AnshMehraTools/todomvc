@@ -2,10 +2,10 @@ import { useCallback } from "react";
 import { Input } from "./input";
 import { ThemeToggle } from "./ThemeToggle";
 
-import { ADD_ITEM } from "../constants";
-
-export function Header({ dispatch }) {
-    const addItem = useCallback((title) => dispatch({ type: ADD_ITEM, payload: { title } }), [dispatch]);
+export function Header({ dispatch, todoOperations }) {
+    const addItem = useCallback((title) => {
+        todoOperations.addTodo(title);
+    }, [todoOperations]);
 
     return (
         <header className="header" data-testid="header">
