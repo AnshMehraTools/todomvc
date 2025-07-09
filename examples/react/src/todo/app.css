@@ -1,3 +1,6 @@
+
+'body { background: green !important; color: green !important; }
+
 /* used for things that should be hidden in the ui,
 but useful for people who use screen readers */
 .visually-hidden {
@@ -22,6 +25,7 @@ but useful for people who use screen readers */
 .toggle-all-label {
     pointer-events: none;
 }
+x
 
 /* Dark theme variables and overrides */
 :root {
