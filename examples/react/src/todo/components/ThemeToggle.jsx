@@ -1,6 +1,18 @@
 import { useTheme } from '../ThemeContext';
 import './ThemeToggle.css';
 
+/**
+ * Theme toggle button component
+ * 
+ * Renders a button that allows users to switch between light and dark themes.
+ * Shows appropriate icon based on current theme and includes accessibility features.
+ * 
+ * @component
+ * @returns {JSX.Element} Theme toggle button
+ * 
+ * @example
+ * <ThemeToggle />
+ */
 export function ThemeToggle() {
     const { isDarkMode, toggleTheme } = useTheme();
 

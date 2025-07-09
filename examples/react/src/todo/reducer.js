@@ -48,6 +48,27 @@ export const initialState = {
     error: null
 };
 
+/**
+ * Todo reducer function for managing application state
+ * 
+ * Handles all todo-related state changes including API loading states,
+ * error handling, and CRUD operations on todos.
+ * 
+ * @param {Object} state - Current application state
+ * @param {string} state.todos - Array of todo items
+ * @param {boolean} state.loading - Loading state indicator
+ * @param {string|null} state.error - Current error message
+ * @param {Object} action - Redux-style action object
+ * @param {string} action.type - Action type constant
+ * @param {*} action.payload - Action payload data
+ * @returns {Object} New state object
+ * 
+ * @example
+ * const newState = todoReducer(currentState, {
+ *   type: 'ADD_TODO_SUCCESS',
+ *   payload: { id: 1, title: 'New todo', completed: false }
+ * });
+ */
 export const todoReducer = (state, action) => {
     switch (action.type) {
         case SET_LOADING:
