@@ -4,9 +4,7 @@ import { useLocation } from "react-router-dom";
 import { Item } from "./item";
 import classnames from "classnames";
 
-import { TOGGLE_ALL } from "../constants";
-
-export function Main({ todos, dispatch }) {
+export function Main({ todos, dispatch, todoOperations }) {
     const { pathname: route } = useLocation();
 
     const visibleTodos = useMemo(
@@ -23,7 +21,9 @@ export function Main({ todos, dispatch }) {
         [todos, route]
     );
 
-    const toggleAll = useCallback((e) => dispatch({ type: TOGGLE_ALL, payload: { completed: e.target.checked } }), [dispatch]);
+    const toggleAll = useCallback((e) => {
+        todoOperations.toggleAll(e.target.checked);
+    }, [todoOperations]);
 
     return (
         <main className="main" data-testid="main">
@@ -37,7 +37,7 @@ export function Main({ todos, dispatch }) {
             ) : null}
             <ul className={classnames("todo-list")} data-testid="todo-list">
                 {visibleTodos.map((todo, index) => (
-                    <Item todo={todo} key={todo.id} dispatch={dispatch} index={index} />
+                    <Item todo={todo} key={todo.id} dispatch={dispatch} todoOperations={todoOperations} index={index} />
                 ))}
             </ul>
         </main>
