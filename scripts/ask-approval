@@ -206,6 +206,8 @@ def main():
     p = argparse.ArgumentParser(description="Phone the user and return the key pressed.")
     p.add_argument("question")
     p.add_argument("options", nargs="+", help="up to 3 options, mapped to keys 1..3")
+    p.add_argument("--attempts", type=int, default=MAX_ATTEMPTS, choices=[1, 2],
+                   help="1 = never re-dial (use for anyone but yourself); default 2 = re-ask once")
     p.add_argument("--dry-run", action="store_true", help="print the request body, place no call")
     p.add_argument("--debug-trace", help="save the raw leg + trace JSON to this file")
     a = p.parse_args()
@@ -222,14 +224,14 @@ def main():
         return
     run_id = uuid.uuid4().hex
     reason = "unknown"
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, a.attempts + 1):
         digit, label, leg_id = one_attempt(a.question, a.options, attempt, run_id, a.debug_trace)
         if digit:
             print(json.dumps({"answered": True, "digit": digit, "option": label,
                               "attempts": attempt, "leg_id": leg_id}))
             return
         reason = label
-    print(json.dumps({"answered": False, "reason": reason, "attempts": MAX_ATTEMPTS}))
+    print(json.dumps({"answered": False, "reason": reason, "attempts": a.attempts}))
     sys.exit(2)
 
 
