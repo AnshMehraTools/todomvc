@@ -136,29 +136,23 @@ def api(method, path, body=None, idem_key=None, ok=(200, 202), retries=3):
 
 
 def find_choice(trace, options):
-    """Return (digit, option_label) pressed in a gather, or (None, reason)."""
-    # The trace carries the selected match name (opt1..optN) even for private gathers.
-    # Walk spans looking for the selected match / digits on the gather node.
-    found = {}
+    """Read the gather result from the leg trace.
 
-    def walk(o):
-        if isinstance(o, dict):
-            for k, v in o.items():
-                if k in ("match", "matched", "selected_match", "selected", "outcome", "port", "digits", "digit") \
-                        and isinstance(v, (str, int)):
-                    found.setdefault(k, []).append(str(v))
-                walk(v)
-        elif isinstance(o, list):
-            for i in o:
-                walk(i)
-
-    walk(trace)
-    for i in range(1, len(options) + 1):
-        # NB: never search the raw trace text: it embeds the frozen definition,
-        # which always contains every option name.
-        if any(f"opt{i}" == x for vals in found.values() for x in vals):
-            return str(i), options[i - 1]
-    return None, "no_valid_key"
+    The gather node's span (data.type == "node", data.node_id == "pick") carries
+    data.selected_port ("opt1".."optN", "timeout" or "fallback") and
+    data.output {"digits": "...", "reason": "..."}. selected_port is present even
+    when the gather is private. Returns (digit, option_label) or (None, reason).
+    Never search the raw trace text: it embeds the frozen definition, which
+    contains every option name.
+    """
+    for span in trace.get("spans", []):
+        d = span.get("data") or {}
+        if d.get("type") == "node" and d.get("node_id") == "pick":
+            port = d.get("selected_port") or ""
+            if port.startswith("opt") and port[3:].isdigit() and 1 <= int(port[3:]) <= len(options):
+                return port[3:], options[int(port[3:]) - 1]
+            return None, ((d.get("output") or {}).get("reason") or port or "no_valid_key")
+    return None, "gather_not_reached"
 
 
 def one_attempt(question, options, attempt, run_id, debug_trace=None):
@@ -195,7 +189,9 @@ def one_attempt(question, options, attempt, run_id, debug_trace=None):
     digit, label = find_choice(trace, options)
     if digit is None:
         why = leg.get("rejection_reason") or leg.get("status") or label
-        if leg.get("sip_response_code"):
+        if leg.get("answered_at"):
+            why = f"answered_but_{label}"   # e.g. answered_but_initial_timeout
+        elif leg.get("sip_response_code"):
             why = f"{why} (SIP {leg['sip_response_code']}, answered={bool(leg.get('answered_at'))})"
         return None, why, leg_id
     return digit, label, leg_id
