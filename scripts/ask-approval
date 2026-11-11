@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""ask-approval: phone the user, read a question, and return the key they press.
+
+Usage:
+  scripts/ask-approval "Delete the unused B-roll folder?" "Approve" "Reject" "More options"
+  scripts/ask-approval --dry-run "Question?" "Yes" "No"
+
+Options are mapped to keys 1..N in the order given (max 3).
+
+Output (stdout, one JSON line):
+  {"answered": true,  "digit": "1", "option": "Approve", "attempts": 1}
+  {"answered": false, "reason": "no_answer", "attempts": 2}
+
+Exit codes:
+  0  user pressed a valid key
+  2  no usable answer after one re-ask  -> ask the user in the chat instead of guessing
+  1  setup or API error (message on stderr)
+
+Config (environment variables, or a .env file at the repo root; env wins):
+  BIRD_API_KEY     Bird API key (bk_...)      required, never printed
+  BIRD_API_URL     e.g. https://us1.platform.bird.com
+  APPROVAL_PHONE   your number, E.164         required
+  BIRD_CALLER_ID   caller ID verified in Bird required
+"""
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ATTEMPT_DEADLINE_S = 120   # give up on one call after ~2 minutes
+MAX_ATTEMPTS = 2           # first ask + one re-ask
+MAX_OPTIONS = 3
+MAX_SPOKEN_WORDS = 50      # ~20 seconds of speech
+RINGING_TIMEOUT_S = 45
+GATHER_TIMEOUT_S = 10
+POLL_S = 3
+
+
+def load_env():
+    env_file = REPO_ROOT / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def die(msg, code=1):
+    print(f"ask-approval: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def require(name):
+    v = os.environ.get(name)
+    if not v:
+        die(f"missing {name}. Set it in the environment or in {REPO_ROOT}/.env")
+    return v
+
+
+def build_sequence(question, options):
+    """Inline sequence: say(question) -> gather one key -> exit with the choice."""
+    menu = ", ".join(f"press {i} for {o}" for i, o in enumerate(options, 1))
+    nodes = [
+        {"id": "start", "type": "trigger.start_call", "type_version": 1, "config": {}, "input": {},
+         "connections": {"event": {"node_id": "ask", "port": "input"}}},
+        {"id": "ask", "type": "voice.say", "type_version": 1, "config": {},
+         "input": {"text": question, "language": "en"},
+         "connections": {"next": {"node_id": "pick", "port": "input"}}},
+    ]
+    matches = {f"opt{i}": str(i) for i in range(1, len(options) + 1)}
+    connections = {name: {"node_id": f"exit_{name}", "port": "input"} for name in matches}
+    connections["timeout"] = {"node_id": "exit_timeout", "port": "input"}
+    connections["fallback"] = {"node_id": "exit_invalid", "port": "input"}
+    nodes.append({
+        "id": "pick", "type": "voice.gather", "type_version": 1, "config": {},
+        "input": {
+            "prompts": [{"type": "say", "text": menu.capitalize() + ".", "language": "en"}],
+            "max_digits": 1,
+            "timeout_seconds": GATHER_TIMEOUT_S,
+            "inter_digit_timeout_seconds": 2,
+            "finish_on_key": None,
+            "private": False,  # keep digits in the trace so we can read them
+            "matches": matches,
+        },
+        "connections": connections,
+    })
+    for name in matches:
+        nodes.append({"id": f"exit_{name}", "type": "logic.exit", "type_version": 1,
+                      "config": {"status": "succeeded", "reason": name}, "input": {"output": {}}})
+    for name in ("timeout", "invalid"):
+        nodes.append({"id": f"exit_{name}", "type": "logic.exit", "type_version": 1,
+                      "config": {"status": "failed", "reason": name}, "input": {"output": {}}})
+    return {
+        "schema_version": 1,
+        "expression_environment": "bird.cel.v1",
+        "nodes": nodes,
+    }
+
+
+def api(method, path, body=None, idem_key=None, ok=(200, 202), retries=3):
+    """HTTP call to Bird. Retries only transient errors, reusing the same bytes/key."""
+    url = require("BIRD_API_URL").rstrip("/") + path
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Authorization": f"Bearer {require('BIRD_API_KEY')}", "Content-Type": "application/json"}
+    if idem_key:
+        headers["Idempotency-Key"] = idem_key
+    last = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read() or b"null")
+        except urllib.error.HTTPError as e:
+            payload = e.read().decode(errors="replace")[:2000]
+            if e.code in (425, 429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(2 * (attempt + 1))
+                last = (e.code, payload)
+                continue
+            return e.code, payload
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))
+                last = (0, str(e))
+                continue
+            return 0, str(e)
+    return last
+
+
+def find_choice(trace, options):
+    """Return (digit, option_label) pressed in a gather, or (None, reason)."""
+    # The trace carries the selected match name (opt1..optN) even for private gathers.
+    # Walk spans looking for the selected match / digits on the gather node.
+    found = {}
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in ("match", "matched", "selected_match", "selected", "outcome", "port", "digits", "digit") \
+                        and isinstance(v, (str, int)):
+                    found.setdefault(k, []).append(str(v))
+                walk(v)
+        elif isinstance(o, list):
+            for i in o:
+                walk(i)
+
+    walk(trace)
+    for i in range(1, len(options) + 1):
+        # NB: never search the raw trace text: it embeds the frozen definition,
+        # which always contains every option name.
+        if any(f"opt{i}" == x for vals in found.values() for x in vals):
+            return str(i), options[i - 1]
+    return None, "no_valid_key"
+
+
+def one_attempt(question, options, attempt, run_id, debug_trace=None):
+    to = require("APPROVAL_PHONE")
+    body = {
+        "from": require("BIRD_CALLER_ID"),
+        "to": to,
+        "ringing_timeout_seconds": RINGING_TIMEOUT_S,
+        "sequence": {"entry_node_id": "start", "trigger_data": {},
+                     "definition": build_sequence(question, options)},
+    }
+    # One stable key per intended call: a retry of the same attempt can never double-dial.
+    key = hashlib.sha256(f"{run_id}:{attempt}:{question}:{options}".encode()).hexdigest()[:48]
+    status, resp = api("POST", "/v1/voice/calls", body, idem_key=key)
+    if status not in (200, 202):
+        die(f"Bird refused the call (HTTP {status}): {resp}")
+    leg_id = resp["initial_leg_id"]
+    deadline = time.time() + ATTEMPT_DEADLINE_S
+    leg = {}
+    while time.time() < deadline:
+        time.sleep(POLL_S)
+        s, leg = api("GET", f"/v1/voice/legs/{leg_id}")
+        if s != 200:
+            continue
+        if leg.get("ended_at"):
+            break
+    else:
+        return None, "timed_out_waiting", leg_id
+    s, trace = api("GET", f"/v1/voice/legs/{leg_id}/trace", retries=6)
+    if s != 200:
+        return None, f"trace_unavailable_{s}", leg_id
+    if debug_trace:
+        Path(debug_trace).write_text(json.dumps({"leg": leg, "trace": trace}, indent=2))
+    digit, label = find_choice(trace, options)
+    if digit is None:
+        return None, (leg.get("rejection_reason") or leg.get("status") or label), leg_id
+    return digit, label, leg_id
+
+
+def main():
+    load_env()
+    p = argparse.ArgumentParser(description="Phone the user and return the key pressed.")
+    p.add_argument("question")
+    p.add_argument("options", nargs="+", help="up to 3 options, mapped to keys 1..3")
+    p.add_argument("--dry-run", action="store_true", help="print the request body, place no call")
+    p.add_argument("--debug-trace", help="save the raw leg + trace JSON to this file")
+    a = p.parse_args()
+    if len(a.options) > MAX_OPTIONS:
+        die(f"at most {MAX_OPTIONS} options")
+    spoken = a.question + " " + " ".join(a.options)
+    if len(spoken.split()) > MAX_SPOKEN_WORDS:
+        die(f"too long to speak in ~20s ({len(spoken.split())} words > {MAX_SPOKEN_WORDS}); shorten it")
+    if a.dry_run:
+        print(json.dumps({"from": os.environ.get("BIRD_CALLER_ID", "<BIRD_CALLER_ID>"),
+                          "to": "<APPROVAL_PHONE>",
+                          "sequence": {"entry_node_id": "start", "trigger_data": {},
+                                       "definition": build_sequence(a.question, a.options)}}, indent=2))
+        return
+    run_id = uuid.uuid4().hex
+    reason = "unknown"
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        digit, label, leg_id = one_attempt(a.question, a.options, attempt, run_id, a.debug_trace)
+        if digit:
+            print(json.dumps({"answered": True, "digit": digit, "option": label,
+                              "attempts": attempt, "leg_id": leg_id}))
+            return
+        reason = label
+    print(json.dumps({"answered": False, "reason": reason, "attempts": MAX_ATTEMPTS}))
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
