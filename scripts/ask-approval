@@ -194,7 +194,10 @@ def one_attempt(question, options, attempt, run_id, debug_trace=None):
         Path(debug_trace).write_text(json.dumps({"leg": leg, "trace": trace}, indent=2))
     digit, label = find_choice(trace, options)
     if digit is None:
-        return None, (leg.get("rejection_reason") or leg.get("status") or label), leg_id
+        why = leg.get("rejection_reason") or leg.get("status") or label
+        if leg.get("sip_response_code"):
+            why = f"{why} (SIP {leg['sip_response_code']}, answered={bool(leg.get('answered_at'))})"
+        return None, why, leg_id
     return digit, label, leg_id
 
 
