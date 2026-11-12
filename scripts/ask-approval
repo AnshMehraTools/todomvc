@@ -1,26 +1,38 @@
 #!/usr/bin/env python3
-"""ask-approval: phone the user, read a question, and return the key they press.
+"""ask-approval: phone the approver, read a question, and return the key they press.
 
 Usage:
-  scripts/ask-approval "Delete the unused B-roll folder?" "Approve" "Reject" "More options"
+  scripts/ask-approval "Export the final cut as MP4?" "Export it" "Not yet" "Something else"
   scripts/ask-approval --dry-run "Question?" "Yes" "No"
 
 Options are mapped to keys 1..N in the order given (max 3).
+CONVENTION: option 1 is always the action Claude intends to take. Only pressing a key in
+--approve-digits (default "1") records a grant that unlocks one risky command in the
+approval-gate hook. Other keys are alternatives or a decline.
 
 Output (stdout, one JSON line):
-  {"answered": true,  "digit": "1", "option": "Approve", "attempts": 1}
-  {"answered": false, "reason": "no_answer", "attempts": 2}
+  {"answered": true,  "digit": "1", "option": "Export it", "approved": true, "attempts": 1}
+  {"answered": false, "reason": "answered_but_initial_timeout", "attempts": 2}
 
 Exit codes:
-  0  user pressed a valid key
-  2  no usable answer after one re-ask  -> ask the user in the chat instead of guessing
+  0  approver pressed a valid key (check "approved": option 1 vs an alternative)
   1  setup or API error (message on stderr)
+  2  no usable answer after one re-ask -> ask in the chat instead of guessing
+  3  quiet hours for the approver, no call placed -> ask in the chat / wait
+  4  call budget for this hour used up, no call placed -> ask in the chat
 
 Config (environment variables, or a .env file at the repo root; env wins):
-  BIRD_API_KEY     Bird API key (bk_...)      required, never printed
-  BIRD_API_URL     e.g. https://us1.platform.bird.com
-  APPROVAL_PHONE   your number, E.164         required
-  BIRD_CALLER_ID   caller ID verified in Bird required
+  BIRD_API_KEY            Bird API key (bk_...)             required, never printed
+  BIRD_API_URL            e.g. https://us1.platform.bird.com
+  APPROVAL_PHONE          approver's number, E.164          required
+  BIRD_CALLER_ID          caller ID verified in Bird        required
+  APPROVAL_INTRO          spoken before every question (default below)
+  APPROVAL_TZ             approver's time zone              default Asia/Dubai
+  APPROVAL_QUIET          quiet hours "start-end" (24h)     default 22-07, empty = off
+  APPROVAL_MAX_PER_HOUR   max calls placed per rolling hour default 6
+  APPROVAL_APPROVE_DIGITS keys that count as approval       default 1
+
+State (gitignored, no phone numbers): .approval-state/log.jsonl and grant.json
 """
 import argparse
 import hashlib
@@ -31,16 +43,22 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+STATE_DIR = REPO_ROOT / ".approval-state"
+LOG_FILE = STATE_DIR / "log.jsonl"
+GRANT_FILE = STATE_DIR / "grant.json"
+
 ATTEMPT_DEADLINE_S = 120   # give up on one call after ~2 minutes
 MAX_ATTEMPTS = 2           # first ask + one re-ask
 MAX_OPTIONS = 3
-MAX_SPOKEN_WORDS = 50      # ~20 seconds of speech
+MAX_SPOKEN_WORDS = 50      # ~20 seconds of speech, intro included
 RINGING_TIMEOUT_S = 45
 GATHER_TIMEOUT_S = 10
 POLL_S = 3
+DEFAULT_INTRO = "Approval request from your video editing assistant."
 
 
 def load_env():
@@ -66,14 +84,77 @@ def require(name):
     return v
 
 
-def build_sequence(question, options):
-    """Inline sequence: say(question) -> gather one key -> exit with the choice."""
+# ---------- guard rails: quiet hours, call budget, audit log, grant ----------
+
+def approver_now():
+    tzname = os.environ.get("APPROVAL_TZ", "Asia/Dubai")
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tzname))
+    except Exception:
+        if tzname == "Asia/Dubai":  # no tz database installed: Dubai has no DST, fixed UTC+4
+            return datetime.now(timezone(timedelta(hours=4)))
+        die(f"cannot resolve time zone {tzname!r}; install tzdata or set APPROVAL_TZ=Asia/Dubai")
+
+
+def in_quiet_hours(now):
+    spec = os.environ.get("APPROVAL_QUIET", "22-07").strip()
+    if not spec:
+        return False
+    try:
+        start, end = (int(x) for x in spec.split("-"))
+    except ValueError:
+        die(f"APPROVAL_QUIET must look like 22-07, got {spec!r}")
+    h = now.hour
+    return (h >= start or h < end) if start > end else (start <= h < end)
+
+
+def dials_in_last_hour():
+    if not LOG_FILE.exists():
+        return 0
+    cutoff, n = time.time() - 3600, 0
+    for line in LOG_FILE.read_text().splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("dialed") and e.get("epoch", 0) >= cutoff:
+            n += 1
+    return n
+
+
+def log_attempt(entry):
+    STATE_DIR.mkdir(exist_ok=True)
+    entry = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "epoch": time.time(), **entry}
+    with LOG_FILE.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def write_grant(question, digit, option):
+    STATE_DIR.mkdir(exist_ok=True)
+    tmp = GRANT_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"id": uuid.uuid4().hex[:12], "epoch": time.time(), "question": question,
+                               "digit": digit, "option": option, "consumed": False}))
+    tmp.replace(GRANT_FILE)
+
+
+def clear_grant():
+    try:
+        GRANT_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+# ---------- the call ----------
+
+def build_sequence(spoken_question, options):
+    """Inline sequence: say(intro + question) -> gather one key -> exit with the choice."""
     menu = ", ".join(f"press {i} for {o}" for i, o in enumerate(options, 1))
     nodes = [
         {"id": "start", "type": "trigger.start_call", "type_version": 1, "config": {}, "input": {},
          "connections": {"event": {"node_id": "ask", "port": "input"}}},
         {"id": "ask", "type": "voice.say", "type_version": 1, "config": {},
-         "input": {"text": question, "language": "en"},
+         "input": {"text": spoken_question, "language": "en"},
          "connections": {"next": {"node_id": "pick", "port": "input"}}},
     ]
     matches = {f"opt{i}": str(i) for i in range(1, len(options) + 1)}
@@ -99,14 +180,10 @@ def build_sequence(question, options):
     for name in ("timeout", "invalid"):
         nodes.append({"id": f"exit_{name}", "type": "logic.exit", "type_version": 1,
                       "config": {"status": "failed", "reason": name}, "input": {"output": {}}})
-    return {
-        "schema_version": 1,
-        "expression_environment": "bird.cel.v1",
-        "nodes": nodes,
-    }
+    return {"schema_version": 1, "expression_environment": "bird.cel.v1", "nodes": nodes}
 
 
-def api(method, path, body=None, idem_key=None, ok=(200, 202), retries=3):
+def api(method, path, body=None, idem_key=None, retries=3):
     """HTTP call to Bird. Retries only transient errors, reusing the same bytes/key."""
     url = require("BIRD_API_URL").rstrip("/") + path
     data = json.dumps(body).encode() if body is not None else None
@@ -155,17 +232,16 @@ def find_choice(trace, options):
     return None, "gather_not_reached"
 
 
-def one_attempt(question, options, attempt, run_id, debug_trace=None):
-    to = require("APPROVAL_PHONE")
+def one_attempt(spoken_question, options, attempt, run_id, debug_trace=None):
     body = {
         "from": require("BIRD_CALLER_ID"),
-        "to": to,
+        "to": require("APPROVAL_PHONE"),
         "ringing_timeout_seconds": RINGING_TIMEOUT_S,
         "sequence": {"entry_node_id": "start", "trigger_data": {},
-                     "definition": build_sequence(question, options)},
+                     "definition": build_sequence(spoken_question, options)},
     }
     # One stable key per intended call: a retry of the same attempt can never double-dial.
-    key = hashlib.sha256(f"{run_id}:{attempt}:{question}:{options}".encode()).hexdigest()[:48]
+    key = hashlib.sha256(f"{run_id}:{attempt}:{spoken_question}:{options}".encode()).hexdigest()[:48]
     status, resp = api("POST", "/v1/voice/calls", body, idem_key=key)
     if status not in (200, 202):
         die(f"Bird refused the call (HTTP {status}): {resp}")
@@ -199,31 +275,56 @@ def one_attempt(question, options, attempt, run_id, debug_trace=None):
 
 def main():
     load_env()
-    p = argparse.ArgumentParser(description="Phone the user and return the key pressed.")
+    p = argparse.ArgumentParser(description="Phone the approver and return the key pressed.")
     p.add_argument("question")
-    p.add_argument("options", nargs="+", help="up to 3 options, mapped to keys 1..3")
+    p.add_argument("options", nargs="+", help="up to 3 options; option 1 = the action Claude intends")
     p.add_argument("--attempts", type=int, default=MAX_ATTEMPTS, choices=[1, 2],
-                   help="1 = never re-dial (use for anyone but yourself); default 2 = re-ask once")
+                   help="1 = never re-dial; default 2 = re-ask once")
+    p.add_argument("--approve-digits", default=os.environ.get("APPROVAL_APPROVE_DIGITS", "1"),
+                   help='keys that count as approval and unlock one risky command (default "1")')
     p.add_argument("--dry-run", action="store_true", help="print the request body, place no call")
     p.add_argument("--debug-trace", help="save the raw leg + trace JSON to this file")
     a = p.parse_args()
     if len(a.options) > MAX_OPTIONS:
         die(f"at most {MAX_OPTIONS} options")
-    spoken = a.question + " " + " ".join(a.options)
-    if len(spoken.split()) > MAX_SPOKEN_WORDS:
-        die(f"too long to speak in ~20s ({len(spoken.split())} words > {MAX_SPOKEN_WORDS}); shorten it")
+    intro = os.environ.get("APPROVAL_INTRO", DEFAULT_INTRO).strip()
+    spoken_question = f"{intro} {a.question}".strip()
+    words = len((spoken_question + " " + " ".join(a.options)).split())
+    if words > MAX_SPOKEN_WORDS:
+        die(f"too long to speak in ~20s ({words} words > {MAX_SPOKEN_WORDS}, intro included); shorten it")
     if a.dry_run:
         print(json.dumps({"from": os.environ.get("BIRD_CALLER_ID", "<BIRD_CALLER_ID>"),
                           "to": "<APPROVAL_PHONE>",
                           "sequence": {"entry_node_id": "start", "trigger_data": {},
-                                       "definition": build_sequence(a.question, a.options)}}, indent=2))
+                                       "definition": build_sequence(spoken_question, a.options)}}, indent=2))
         return
+    approve = {d.strip() for d in a.approve_digits.split(",") if d.strip()}
+
+    # A new question supersedes any earlier, unused approval.
+    clear_grant()
+    now = approver_now()
+    if in_quiet_hours(now):
+        print(json.dumps({"answered": False, "reason": "quiet_hours",
+                          "approver_local_time": now.strftime("%H:%M"), "attempts": 0}))
+        sys.exit(3)
+    max_per_hour = int(os.environ.get("APPROVAL_MAX_PER_HOUR", "6"))
+    if dials_in_last_hour() + a.attempts > max_per_hour:
+        print(json.dumps({"answered": False, "reason": "hourly_call_budget_used",
+                          "max_per_hour": max_per_hour, "attempts": 0}))
+        sys.exit(4)
+
     run_id = uuid.uuid4().hex
     reason = "unknown"
     for attempt in range(1, a.attempts + 1):
-        digit, label, leg_id = one_attempt(a.question, a.options, attempt, run_id, a.debug_trace)
+        digit, label, leg_id = one_attempt(spoken_question, a.options, attempt, run_id, a.debug_trace)
+        log_attempt({"dialed": True, "attempt": attempt, "question": a.question, "options": a.options,
+                     "answered": bool(digit), "digit": digit, "option": label if digit else None,
+                     "reason": None if digit else label, "leg_id": leg_id})
         if digit:
-            print(json.dumps({"answered": True, "digit": digit, "option": label,
+            approved = digit in approve
+            if approved:
+                write_grant(a.question, digit, label)
+            print(json.dumps({"answered": True, "digit": digit, "option": label, "approved": approved,
                               "attempts": attempt, "leg_id": leg_id}))
             return
         reason = label

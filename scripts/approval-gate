@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""approval-gate: Claude Code PreToolUse hook (matcher: Bash|Write).
+
+Blocks risky or irreversible actions during video editing unless the approver has just
+pressed an approving key on an ask-approval call. One approval unlocks exactly ONE command
+and expires after APPROVAL_GRANT_TTL_S seconds (default 900).
+
+This is a guard rail against accidents, not a security boundary: the heuristics below can be
+sidestepped (e.g. by deleting through a script), and anyone with shell access can edit the
+state files. It also blocks commands that write to the approval state directory.
+
+Hook protocol: reads the tool call as JSON on stdin; to block, prints a PreToolUse
+permissionDecision "deny" with a reason. Printing nothing and exiting 0 allows the call.
+"""
+import json
+import os
+import re
+import shlex
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(os.environ.get("CLAUDE_PROJECT_DIR") or Path(__file__).resolve().parent.parent)
+STATE_DIR = ROOT / ".approval-state"
+GRANT_FILE = STATE_DIR / "grant.json"
+TTL_S = int(os.environ.get("APPROVAL_GRANT_TTL_S", "900"))
+TMP_ROOTS = (Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve())
+
+MEDIA_EXT = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mxf", ".mts", ".wav", ".mp3", ".aac",
+             ".flac", ".aiff", ".m4a", ".prproj", ".drp", ".fcpxml", ".fcpbundle", ".aep", ".edl",
+             ".xml", ".srt", ".vtt"}
+EXPORT_WORDS = re.compile(r"(final|export|master|render|deliver)", re.I)
+READ_ONLY_CMDS = {"cat", "ls", "head", "tail", "jq", "grep", "wc", "stat", "less"}
+ENCODERS = {"ffmpeg", "avconv", "handbrakecli", "melt", "auto-editor"}
+WRAPPERS = {"sudo", "command", "env", "time", "nice", "nohup", "exec"}
+
+
+def decide(allow=True, reason="", context=""):
+    if allow:
+        if context:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                     "permissionDecision": "allow",
+                                                     "permissionDecisionReason": context,
+                                                     "additionalContext": context}}))
+        sys.exit(0)
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                             "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}))
+    sys.exit(0)
+
+
+def has_media_ext(token):
+    return Path(token.strip("'\"")).suffix.lower() in MEDIA_EXT
+
+
+def under_tmp(token):
+    try:
+        p = Path(token).expanduser()
+        p = (p if p.is_absolute() else Path.cwd() / p).resolve()
+    except (OSError, RuntimeError):
+        return False
+    return any(p == t or t in p.parents for t in TMP_ROOTS)
+
+
+def positional(tokens):
+    return [t for t in tokens[1:] if not t.startswith("-")]
+
+
+def segment_reasons(tokens):
+    """Reasons this single simple command is risky (empty list = fine)."""
+    while tokens and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]) or tokens[0] in WRAPPERS):
+        tokens = tokens[1:]
+    if not tokens:
+        return []
+    cmd = os.path.basename(tokens[0]).lower()
+    args = tokens[1:]
+    flags = [t for t in args if t.startswith("-")]
+    pos = positional(tokens)
+    out = []
+
+    if cmd in {"rm", "unlink", "shred", "trash", "trash-put", "rmdir"}:
+        recursive = any(f in ("-r", "-R", "--recursive") or (not f.startswith("--") and ("r" in f[1:] or "R" in f[1:]))
+                        for f in flags)
+        if any(has_media_ext(t) for t in pos):
+            out.append("deletes a media or project file")
+        elif (recursive or any("*" in t for t in pos)) and not all(under_tmp(t) for t in pos):
+            out.append("recursively deletes files outside a temp directory")
+    elif cmd == "find" and ("-delete" in args or ("-exec" in args and any(os.path.basename(t) == "rm" for t in args))):
+        out.append("find that deletes files")
+    elif cmd in {"mv", "cp", "install", "ln"} and len(pos) >= 2:
+        if "-n" not in flags and "--no-clobber" not in flags and "-i" not in flags:
+            dest = Path(pos[-1])
+            targets = [dest / Path(s).name if dest.is_dir() else dest for s in pos[:-1]]
+            if any(t.is_file() and not under_tmp(str(t)) for t in targets):
+                out.append(f"{cmd} would overwrite an existing file")
+    elif cmd == "rsync" and any(f.startswith("--delete") for f in flags):
+        out.append("rsync --delete removes files at the destination")
+    elif cmd == "dd" and any(t.startswith("of=") for t in args):
+        out.append("dd writes raw output over its target")
+    elif cmd in {"sed", "perl"} and any(f in ("-i", "-pi", "-ip") or f.startswith("-i") for f in flags) \
+            and any(has_media_ext(t) for t in pos):
+        out.append("in-place edit of a project or caption file")
+    elif cmd == "truncate" and any(has_media_ext(t) for t in pos):
+        out.append("truncates a media file")
+    elif cmd in ENCODERS:
+        output = pos[-1] if pos else ""
+        if "-y" in args:
+            out.append(f"{cmd} -y overwrites its output without asking")
+        elif output and Path(output).is_file():
+            out.append("encoder output file already exists")
+        if output and EXPORT_WORDS.search(Path(output).name):
+            out.append("looks like exporting a final/master file")
+    elif cmd == "git" and pos:
+        sub, rest = pos[0], args
+        if sub == "push" and any(t in ("--force", "-f") or t.startswith("--force-with-lease") for t in rest):
+            out.append("force push rewrites remote history")
+        elif sub == "reset" and "--hard" in rest:
+            out.append("git reset --hard discards work")
+        elif sub == "clean" and any(re.fullmatch(r"-[a-zA-Z]*[fd][a-zA-Z]*", t) for t in rest):
+            out.append("git clean deletes untracked files")
+        elif sub == "branch" and "-D" in rest:
+            out.append("force-deletes a branch")
+        elif sub == "stash" and any(t in ("drop", "clear") for t in rest):
+            out.append("drops stashed work")
+        elif sub == "checkout" and ("--" in rest or "." in rest):
+            out.append("discards working-tree changes")
+        elif sub == "restore" and "--staged" not in rest:
+            out.append("discards working-tree changes")
+    return out
+
+
+def command_reasons(command):
+    reasons = []
+    # Redirect that overwrites an existing/clearly-media file: > clip.mp4 (but not >>, 2>&1, /dev/null)
+    for m in re.finditer(r"(?<![>&0-9])>\s*([^\s;&|>]+)", command):
+        target = m.group(1).strip("'\"")
+        if target != "/dev/null" and has_media_ext(target):
+            reasons.append("shell redirect overwrites a media or project file")
+    for seg in re.split(r"&&|\|\||;|\||\n", command):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            tokens = shlex.split(seg)
+        except ValueError:
+            tokens = seg.split()
+        reasons += segment_reasons(tokens)
+    return list(dict.fromkeys(reasons))
+
+
+def touches_state(command):
+    """True if the command could write the approval state (forging a grant)."""
+    if ".approval-state" not in command and "approval-state" not in command:
+        return False
+    first = os.path.basename(command.strip().split()[0]) if command.strip() else ""
+    return not (first in READ_ONLY_CMDS and not re.search(r"[>]|\btee\b|\bsed\s+-i\b", command))
+
+
+def take_grant():
+    """Consume the grant if it is fresh and unused. Returns the grant or None."""
+    try:
+        g = json.loads(GRANT_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    if g.get("consumed") or time.time() - g.get("epoch", 0) > TTL_S:
+        return None
+    g["consumed"] = True
+    g["used_epoch"] = time.time()
+    tmp = GRANT_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(g))
+    tmp.replace(GRANT_FILE)
+    return g
+
+
+def main():
+    try:
+        event = json.load(sys.stdin)
+    except ValueError:
+        decide(True)
+    tool, ti = event.get("tool_name", ""), event.get("tool_input") or {}
+    reasons = []
+    if tool == "Bash":
+        command = ti.get("command", "")
+        if touches_state(command):
+            decide(False, "Blocked: this command would modify the approval state directory "
+                          "(.approval-state). Approvals can only be created by scripts/ask-approval.")
+        reasons = command_reasons(command)
+    elif tool == "Write":
+        path = Path(ti.get("file_path", ""))
+        if STATE_DIR in path.parents:
+            decide(False, "Blocked: the approval state directory can only be written by scripts/ask-approval.")
+        if path.is_file() and path.suffix.lower() in MEDIA_EXT:
+            reasons = ["overwrites an existing media or project file"]
+    if not reasons:
+        decide(True)
+    grant = take_grant()
+    if grant:
+        decide(True, context=(f"Approval {grant['id']} used: approver chose '{grant['option']}' for "
+                              f"'{grant['question']}'. This unlocked one risky action ({'; '.join(reasons)})."))
+    decide(False, (
+        "Blocked by the approval gate: " + "; ".join(reasons) + ". "
+        "This is a creative or irreversible action, so the approver must OK it by phone first. "
+        "Run scripts/ask-approval with the action you intend to take as option 1 (for example: "
+        "scripts/ask-approval \"Export the final cut?\" \"Export it\" \"Not yet\") and wait. "
+        f"If they press 1 this command is unlocked once for {TTL_S // 60} minutes. "
+        "If the call cannot connect (exit codes 2, 3 or 4), ask in the chat instead. Never guess."))
+
+
+if __name__ == "__main__":
+    main()

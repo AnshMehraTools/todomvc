@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Offline tests for scripts/approval-gate. Places no calls and never touches the real
+approval state: everything runs in a throwaway temp project directory.
+
+  python3 scripts/test-approval-gate
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+GATE = Path(__file__).resolve().parent / "approval-gate"
+fails = 0
+
+
+def run(tool_input, tool="Bash", cwd=None, project=None):
+    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(project)}
+    p = subprocess.run([sys.executable, str(GATE)], input=json.dumps({"tool_name": tool, "tool_input": tool_input}),
+                       capture_output=True, text=True, cwd=cwd, env=env)
+    assert p.returncode == 0, p.stderr
+    out = json.loads(p.stdout)["hookSpecificOutput"] if p.stdout.strip() else {}
+    return out.get("permissionDecision", "allow"), out
+
+
+def check(name, got, want):
+    global fails
+    ok = got == want
+    fails += not ok
+    print(f"{'PASS' if ok else 'FAIL'}  {name}: {got}" + ("" if ok else f" (wanted {want})"))
+
+
+# The gate deliberately ignores scratch files under /tmp, so the test project must live elsewhere.
+# /.tmp at the repo root is gitignored.
+SCRATCH = Path(__file__).resolve().parent.parent / ".tmp"
+SCRATCH.mkdir(exist_ok=True)
+with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
+    work = Path(d, "work"); work.mkdir()
+    project = Path(d, "proj"); (project / ".approval-state").mkdir(parents=True)
+    for f in ("clip.mp4", "b.txt", "a.txt"):
+        (work / f).write_text("x")
+    grant = project / ".approval-state" / "grant.json"
+    cmd = lambda c, **k: run({"command": c}, cwd=work, project=project, **k)
+
+    print("-- should be allowed (no grant needed)")
+    for c in ["ls -la", "git status", "git commit -m 'x'", "git push origin main", "rm -f /tmp/scratch.txt",
+              "rm -rf /tmp/some/dir", "cp a.txt new.txt", "ffmpeg -i clip.mp4 preview.mp4",
+              "python3 scripts/ask-approval 'Q?' 'Yes' 'No'", "cat .approval-state/grant.json",
+              "echo hi > notes.txt", "ls | head -3 && echo done"]:
+        check(c, cmd(c)[0], "allow")
+
+    print("-- should be blocked without a grant")
+    for c in ["rm clip.mp4", "rm -rf footage", "rm -r ./raw", "find . -name '*.mov' -delete",
+              "cp a.txt b.txt", "mv a.txt b.txt", "ffmpeg -y -i clip.mp4 out.mp4",
+              "ffmpeg -i clip.mp4 final_cut.mp4", "ffmpeg -i a.mp4 clip.mp4",
+              "git push --force origin main", "git reset --hard HEAD~1", "git clean -fd",
+              "echo x > timeline.mp4", "sed -i 's/a/b/' captions.srt", "ls && rm clip.mp4",
+              "dd if=/dev/zero of=clip.mp4", "rsync -a --delete src/ dst/"]:
+        check(c, cmd(c)[0], "deny")
+
+    print("-- Write tool")
+    check("Write new text file", run({"file_path": str(work / "new.txt")}, tool="Write", cwd=work, project=project)[0], "allow")
+    check("Write over existing .mp4", run({"file_path": str(work / "clip.mp4")}, tool="Write", cwd=work, project=project)[0], "deny")
+
+    print("-- state tampering is always blocked, even with a grant")
+    grant.write_text(json.dumps({"id": "t", "epoch": time.time(), "question": "q", "option": "o", "consumed": False}))
+    check("forge grant via echo", cmd("echo '{}' > .approval-state/grant.json")[0], "deny")
+    check("forge grant via python", cmd("python3 -c \"open('.approval-state/grant.json','w')\"")[0], "deny")
+    check("Write tool into state dir", run({"file_path": str(grant)}, tool="Write", cwd=work, project=project)[0], "deny")
+
+    print("-- one grant unlocks exactly one command")
+    grant.write_text(json.dumps({"id": "g1", "epoch": time.time(), "question": "Delete clip?", "option": "Delete it",
+                                 "consumed": False}))
+    check("risky command with fresh grant", cmd("rm clip.mp4")[0], "allow")
+    check("same grant used again", cmd("rm clip.mp4")[0], "deny")
+
+    print("-- expired grant")
+    grant.write_text(json.dumps({"id": "g2", "epoch": time.time() - 3600, "question": "q", "option": "o",
+                                 "consumed": False}))
+    check("risky command with 1h-old grant", cmd("rm clip.mp4")[0], "deny")
+
+    print("-- no grant file at all")
+    grant.unlink()
+    check("risky command, no grant", cmd("rm clip.mp4")[0], "deny")
+
+print("\nALL PASSED" if not fails else f"\n{fails} FAILED")
+sys.exit(1 if fails else 0)

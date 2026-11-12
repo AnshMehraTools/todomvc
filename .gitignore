@@ -9,3 +9,6 @@
 
 # local secrets (Bird API key, phone number)
 .env
+
+# phone-approval state (audit log + one-time grant)
+.approval-state/
